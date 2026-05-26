@@ -1,0 +1,41 @@
+name: Selftest
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  scan-remote-target:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: trustabl
+        uses: ./
+        with:
+          target: "https://github.com/openai/openai-agents-python"
+          # Don't fail the selftest on findings — we only want to validate
+          # the action's plumbing, not gate on a target we don't control.
+          severity-threshold: "none"
+          risk-score-threshold: "0"
+      - name: Echo outputs
+        run: |
+          echo "exit-code      = ${{ steps.trustabl.outputs.exit-code }}"
+          echo "overall-score  = ${{ steps.trustabl.outputs.overall-score }}"
+          echo "risk-score     = ${{ steps.trustabl.outputs.risk-score }}"
+          echo "max-severity   = ${{ steps.trustabl.outputs.max-severity }}"
+          echo "findings-count = ${{ steps.trustabl.outputs.findings-count }}"
+          ls -la trustabl.sarif trustabl.json
+
+  scan-self-empty:
+    # Sanity: scanning this repo (no agent SDK code) should be a clean pass.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          target: "."

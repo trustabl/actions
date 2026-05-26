@@ -1,0 +1,299 @@
+name: Trustabl
+description: Static reliability/safety analyzer for agent-SDK repos. Emits SARIF, uploads to GitHub Code Scanning, and exports the full JSON scan result as a downloadable artifact.
+author: trustabl
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  target:
+    description: Path or GitHub URL to scan. Defaults to the caller's checkout root.
+    required: false
+    default: "."
+  version:
+    description: trustabl release version (e.g. v0.5.0) or 'latest'.
+    required: false
+    default: latest
+  detectors:
+    description: Comma-separated SDK detectors (claude_sdk,openai_sdk,google_adk). Empty = all.
+    required: false
+    default: ""
+  strict:
+    description: Pass --strict (fail on any finding regardless of severity).
+    required: false
+    default: "false"
+  rules-ref:
+    description: Pin trustabl-rules git ref. Empty = action default.
+    required: false
+    default: ""
+  rules-repo:
+    description: Override trustabl-rules source repo (owner/name or URL).
+    required: false
+    default: ""
+  upload-sarif:
+    description: Upload trustabl.sarif to GitHub Code Scanning.
+    required: false
+    default: "true"
+  sarif-file:
+    description: Path to write SARIF output.
+    required: false
+    default: trustabl.sarif
+  json-file:
+    description: Path to write the full JSON ScanResult. Uploaded as an artifact when upload-artifact is true.
+    required: false
+    default: trustabl.json
+  upload-artifact:
+    description: Upload the JSON (and SARIF) scan result as a workflow artifact so it can be downloaded from the run page.
+    required: false
+    default: "true"
+  artifact-name:
+    description: Name of the uploaded artifact.
+    required: false
+    default: trustabl-scan-results
+  artifact-retention-days:
+    description: How many days the artifact is kept (1-90). Empty = repo default.
+    required: false
+    default: ""
+  risk-score-threshold:
+    description: |
+      Fail the job when the computed risk score (100 - overall_score) is
+      greater than or equal to this number. Range 0-100. Default 0 = disabled
+      (never fails on score). Example: 70 means "fail if risk >= 70".
+    required: false
+    default: "0"
+  severity-threshold:
+    description: |
+      Fail the job when ANY finding's severity is >= this level.
+      One of: none | low | medium | high | critical. Default 'none' = disabled.
+      Independent of --strict and the built-in medium-default exit code; this
+      input overrides the final exit code only when it triggers a failure.
+    required: false
+    default: "none"
+  branch:
+    description: |
+      Branch label for the scan run (used in SARIF category and logs).
+      If empty, auto-detected from the checkout — preferring main, then master,
+      then whatever HEAD points at. Caller may pin explicitly (e.g. develop).
+    required: false
+    default: ""
+
+outputs:
+  sarif-file:
+    description: Path to the emitted SARIF file.
+    value: ${{ inputs.sarif-file }}
+  json-file:
+    description: Path to the emitted JSON ScanResult file.
+    value: ${{ inputs.json-file }}
+  exit-code:
+    description: trustabl native exit code (0 clean, 1 findings, 2 error).
+    value: ${{ steps.scan.outputs.exit-code }}
+  overall-score:
+    description: Readiness score 0-100 (higher = better).
+    value: ${{ steps.scan.outputs.overall-score }}
+  risk-score:
+    description: Computed risk score = 100 - overall-score.
+    value: ${{ steps.scan.outputs.risk-score }}
+  max-severity:
+    description: Highest severity present in findings (none if no findings).
+    value: ${{ steps.scan.outputs.max-severity }}
+  findings-count:
+    description: Total finding count.
+    value: ${{ steps.scan.outputs.findings-count }}
+  artifact-name:
+    description: Name of the uploaded artifact (when upload-artifact is true).
+    value: ${{ inputs.artifact-name }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve-branch
+      shell: bash
+      run: |
+        set -euo pipefail
+        BR="${{ inputs.branch }}"
+        TARGET="${{ inputs.target }}"
+        if [ -z "$BR" ]; then
+          if [ -d "$TARGET/.git" ] || git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
+            if   git -C "$TARGET" show-ref --verify --quiet refs/heads/main;   then BR=main
+            elif git -C "$TARGET" show-ref --verify --quiet refs/heads/master; then BR=master
+            else BR=$(git -C "$TARGET" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+            fi
+          else
+            BR=unknown
+          fi
+        fi
+        echo "branch=$BR" >> "$GITHUB_OUTPUT"
+        echo "Trustabl scanning branch: $BR"
+
+    - id: resolve-version
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        VER="${{ inputs.version }}"
+        if [ "$VER" = "latest" ]; then
+          VER=$(gh release view --repo trustabl/trustabl --json tagName -q .tagName)
+        fi
+        echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+    - id: install
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve-version.outputs.version }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        VNUM="${VERSION#v}"
+        case "${RUNNER_OS}" in
+          Linux)   OS=linux;   EXT=tar.gz ;;
+          macOS)   OS=darwin;  EXT=tar.gz ;;
+          Windows) OS=windows; EXT=zip ;;
+          *) echo "Unsupported RUNNER_OS=$RUNNER_OS"; exit 1 ;;
+        esac
+        case "${RUNNER_ARCH}" in
+          X64)   ARCH=amd64 ;;
+          ARM64) ARCH=arm64 ;;
+          *) echo "Unsupported RUNNER_ARCH=$RUNNER_ARCH"; exit 1 ;;
+        esac
+        ASSET="trustabl_${VNUM}_${OS}_${ARCH}.${EXT}"
+        DEST="${RUNNER_TEMP}/trustabl"
+        mkdir -p "$DEST"
+        # `gh release download` hits the REST API asset endpoint with
+        # Accept: application/octet-stream — the documented path that
+        # increments the per-asset download counter on trustabl/trustabl.
+        gh release download "$VERSION" \
+          --repo trustabl/trustabl \
+          --pattern "$ASSET" \
+          --dir "$DEST"
+        if [ "$EXT" = "zip" ]; then
+          unzip -q "${DEST}/${ASSET}" -d "$DEST"
+        else
+          tar -xzf "${DEST}/${ASSET}" -C "$DEST"
+        fi
+        echo "$DEST" >> "$GITHUB_PATH"
+
+    - id: scan
+      shell: bash
+      env:
+        TRUSTABL_RULES_REPO: ${{ inputs.rules-repo }}
+      run: |
+        set +e
+        BASE_ARGS=(scan "${{ inputs.target }}")
+        [ -n "${{ inputs.detectors }}" ] && BASE_ARGS+=(--detectors "${{ inputs.detectors }}")
+        [ "${{ inputs.strict }}"     = "true" ] && BASE_ARGS+=(--strict)
+        [ -n "${{ inputs.rules-ref }}" ] && BASE_ARGS+=(--rules-ref "${{ inputs.rules-ref }}")
+
+        # Run 1: SARIF (file emit + upload).
+        trustabl "${BASE_ARGS[@]}" --format sarif > "${{ inputs.sarif-file }}"
+        NATIVE_CODE=$?
+
+        # Run 2: JSON (drives threshold gates, log summary, downloadable artifact).
+        # Written into the workspace so actions/upload-artifact can pick it up.
+        JSON_FILE="${{ inputs.json-file }}"
+        trustabl "${BASE_ARGS[@]}" --format json > "$JSON_FILE" || true
+
+        SCORE=$(jq -r '.overall_score // 100'   "$JSON_FILE")
+        COUNT=$(jq -r '.findings | length // 0' "$JSON_FILE")
+        MAX_SEV=$(jq -r '
+          [.findings[].severity] as $s
+          | if ($s|length)==0 then "none"
+            elif any($s[]; .=="critical") then "critical"
+            elif any($s[]; .=="high")     then "high"
+            elif any($s[]; .=="medium")   then "medium"
+            elif any($s[]; .=="low")      then "low"
+            else "info" end
+        ' "$JSON_FILE")
+        RISK=$(awk -v s="$SCORE" 'BEGIN{ printf "%d", (100 - s) + 0.5 }')
+
+        echo "exit-code=$NATIVE_CODE"   >> "$GITHUB_OUTPUT"
+        echo "overall-score=$SCORE"     >> "$GITHUB_OUTPUT"
+        echo "risk-score=$RISK"         >> "$GITHUB_OUTPUT"
+        echo "max-severity=$MAX_SEV"    >> "$GITHUB_OUTPUT"
+        echo "findings-count=$COUNT"    >> "$GITHUB_OUTPUT"
+
+        echo "──── Trustabl summary ────"
+        echo "overall_score = $SCORE   (risk = $RISK)"
+        echo "findings      = $COUNT   (max severity: $MAX_SEV)"
+        echo "native exit   = $NATIVE_CODE"
+
+        FAIL=0; REASONS=()
+        if [ "$NATIVE_CODE" = "2" ]; then FAIL=1; REASONS+=("scanner error (exit 2)"); fi
+        if [ "$NATIVE_CODE" = "1" ]; then FAIL=1; REASONS+=("trustabl gated (medium+ or --strict)"); fi
+
+        RST="${{ inputs.risk-score-threshold }}"
+        if [ "$RST" -gt 0 ] 2>/dev/null && [ "$RISK" -ge "$RST" ]; then
+          FAIL=1; REASONS+=("risk $RISK >= threshold $RST")
+        fi
+
+        sev_rank() { case "$1" in critical) echo 4;; high) echo 3;; medium) echo 2;; low) echo 1;; info) echo 0;; *) echo -1;; esac; }
+        ST="${{ inputs.severity-threshold }}"
+        if [ "$ST" != "none" ] && [ "$ST" != "" ]; then
+          if [ "$(sev_rank "$MAX_SEV")" -ge "$(sev_rank "$ST")" ] && [ "$COUNT" -gt 0 ]; then
+            FAIL=1; REASONS+=("max severity $MAX_SEV >= threshold $ST")
+          fi
+        fi
+
+        GREEN=$'\e[1;32m'; RED=$'\e[1;31m'; RESET=$'\e[0m'
+        SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+        {
+          echo "## Trustabl scan"
+          echo ""
+          echo "| Metric | Value |"
+          echo "|---|---|"
+          echo "| Overall score | \`$SCORE\` |"
+          echo "| Risk score    | \`$RISK\` |"
+          echo "| Findings      | \`$COUNT\` |"
+          echo "| Max severity  | \`$MAX_SEV\` |"
+          echo "| Native exit   | \`$NATIVE_CODE\` |"
+          echo ""
+        } >> "$SUMMARY"
+
+        if [ "$FAIL" = "1" ]; then
+          printf '%b\n' "${RED}✗ Failed due to: ${REASONS[*]}${RESET}"
+          {
+            echo "### ❌ Failed"
+            echo ""
+            echo "| Gate | Threshold | Detected | Result |"
+            echo "|---|---|---|---|"
+            if [ -n "$RST" ] && [ "$RST" -gt 0 ] 2>/dev/null; then
+              if [ "$RISK" -ge "$RST" ]; then VERDICT="❌ over"; else VERDICT="✅ under"; fi
+              echo "| risk-score | \`>= $RST\` | \`$RISK\` | $VERDICT |"
+            fi
+            if [ "$ST" != "none" ] && [ "$ST" != "" ]; then
+              if [ "$(sev_rank "$MAX_SEV")" -ge "$(sev_rank "$ST")" ] && [ "$COUNT" -gt 0 ]; then
+                VERDICT="❌ exceeded"
+              else
+                VERDICT="✅ ok"
+              fi
+              echo "| severity | \`>= $ST\` | \`$MAX_SEV\` | $VERDICT |"
+            fi
+            if [ "$NATIVE_CODE" != "0" ]; then
+              echo "| trustabl native | \`exit 0\` | \`exit $NATIVE_CODE\` | ❌ |"
+            fi
+            echo ""
+            printf '**Failed due to:** %s\n' "${REASONS[*]}"
+          } >> "$SUMMARY"
+          exit 1
+        fi
+
+        printf '%b\n' "${GREEN}✓ Successfully passed scanning${RESET}"
+        echo "### ✅ Successfully passed scanning" >> "$SUMMARY"
+        exit 0
+
+    - if: ${{ always() && inputs.upload-sarif == 'true' && hashFiles(inputs.sarif-file) != '' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        category: trustabl-${{ steps.resolve-branch.outputs.branch }}
+
+    - if: ${{ always() && inputs.upload-artifact == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ inputs.json-file }}
+          ${{ inputs.sarif-file }}
+        if-no-files-found: warn
+        retention-days: ${{ inputs.artifact-retention-days }}

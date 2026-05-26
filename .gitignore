@@ -1,0 +1,10 @@
+# Claude / agent tooling
+CLAUDE.md
+.claude/
+.claude-*/
+.anthropic/
+
+# Local scan artifacts
+*.sarif
+trustabl.json
+trustabl/
