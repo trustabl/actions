@@ -182,8 +182,25 @@ runs:
       shell: bash
       env:
         TRUSTABL_RULES_REPO: ${{ inputs.rules-repo }}
+        BRANCH: ${{ steps.resolve-branch.outputs.branch }}
       run: |
         set +e
+        TARGET="${{ inputs.target }}"
+
+        # Resolve the repo label (used in the report box + step summary).
+        # Priority: explicit GitHub URL → target's git remote → caller's repo.
+        REPO=""
+        if [[ "$TARGET" =~ ^https?://github\.com/([^/]+/[^/]+)(\.git)?/?$ ]]; then
+          REPO="${BASH_REMATCH[1]%.git}"
+        elif [ -d "$TARGET/.git" ] || git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
+          REMOTE=$(git -C "$TARGET" config --get remote.origin.url 2>/dev/null || true)
+          if [[ "$REMOTE" =~ github\.com[:/]([^/]+/[^/]+?)(\.git)?$ ]]; then
+            REPO="${BASH_REMATCH[1]%.git}"
+          fi
+        fi
+        [ -z "$REPO" ] && REPO="${{ github.repository }}"
+        [ -z "$REPO" ] && REPO="$TARGET"
+
         BASE_ARGS=(scan "${{ inputs.target }}")
         [ -n "${{ inputs.detectors }}" ] && BASE_ARGS+=(--detectors "${{ inputs.detectors }}")
         [ "${{ inputs.strict }}"     = "true" ] && BASE_ARGS+=(--strict)
@@ -245,15 +262,23 @@ runs:
 
         # ASCII-safe title (no emoji) so ${#TITLE} == display width across
         # every terminal — emoji codepoints render 2 cells but count as 1 char.
-        TITLE="TRUSTABL SCAN REPORT"
+        TITLE="TRUSTABL SUMMARY REPORT"
         TLEN=${#TITLE}
         LP=$(( (58 - TLEN) / 2 ))
         RP=$(( 58 - TLEN - LP ))
+
+        # Truncate long values so they never overflow the box.
+        trunc() { local s="$1" max="$2"; if [ ${#s} -gt "$max" ]; then printf '%s…' "${s:0:$((max-1))}"; else printf '%s' "$s"; fi; }
+        REPO_DISP=$(trunc "$REPO"   "$VAL_W")
+        BR_DISP=$(trunc   "$BRANCH" "$VAL_W")
 
         echo ""
         printf '%b┌%s┐%b\n' "$FG_CYA" "$DASH_TOP" "$RESET"
         printf '%b│%b%*s%b%s%b%*s%b│%b\n' "$FG_CYA" "$RESET" "$LP" '' "$BOLD" "$TITLE" "$RESET" "$RP" '' "$FG_CYA" "$RESET"
         printf '%b├%s┬%s┤%b\n' "$FG_CYA" "$DASH_L" "$DASH_R" "$RESET"
+        cell "Repository"    "$FG_MAG"                   "$REPO_DISP"
+        cell "Branch"        "$FG_CYA"                   "$BR_DISP"
+        printf '%b├%s┼%s┤%b\n' "$FG_CYA" "$DASH_L" "$DASH_R" "$RESET"
         cell "Overall score" "$(score_color "$SCORE")"   "$SCORE"
         cell "Risk score"    "$(risk_color  "$RISK")"    "$RISK / 100"
         cell "Findings"      "$BOLD"                     "$COUNT"
@@ -287,6 +312,8 @@ runs:
           echo ""
           echo "| Metric | Value |"
           echo "|---|---|"
+          echo "| Repository    | \`$REPO\` |"
+          echo "| Branch        | \`$BRANCH\` |"
           echo "| Overall score | \`$SCORE\` |"
           echo "| Risk score    | \`$RISK\` |"
           echo "| Findings      | \`$COUNT\` |"
