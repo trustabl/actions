@@ -5,6 +5,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.1.1] — 2026-05-27
+
+### Fixed
+
+- **Branch resolution for remote URL targets.** When `target` was a
+  `https://github.com/OWNER/NAME` URL (rather than a local path), the
+  branch row in the summary box showed `unknown` because the resolver
+  only inspected local checkouts. The resolver now queries the
+  GitHub REST API (`gh api repos/OWNER/NAME --jq .default_branch`)
+  using the runner's `${{ github.token }}` and surfaces the remote's
+  default branch (the branch trustabl actually clones and scans).
+  Local-path targets still prefer `main` → `master` → HEAD; `unknown`
+  remains the documented last-resort.
+
 ## [0.1.0] — 2026-05-26
 
 First Marketplace release (0.x = pre-stable; pin to `@v0.1.0`, not a
@@ -54,7 +68,7 @@ and gates the pipeline on readiness, risk, or severity thresholds.
   `findings-count`, `exit-code`, `sarif-file`, `json-file`,
   `artifact-name` for downstream steps.
 - **Zero-config defaults** — minimum call is
-  `uses: trustabl/actions@v1` after `actions/checkout`. Every input has a
+  `uses: trustabl/actions@v0.1.0` after `actions/checkout`. Every input has a
   sensible default.
 - **`.gitignore`** — excludes Claude / agent tooling artifacts
   (`CLAUDE.md`, `.claude/`, `.anthropic/`) and local scan outputs
@@ -92,4 +106,5 @@ and gates the pipeline on readiness, risk, or severity thresholds.
   need `gh`, `jq`, `curl`, `tar` (and `unzip` on Windows) available on
   PATH.
 
+[0.1.1]: https://github.com/trustabl/actions/releases/tag/v0.1.1
 [0.1.0]: https://github.com/trustabl/actions/releases/tag/v0.1.0
